@@ -46,14 +46,20 @@ location: https://newdomain.com/blog/post?id=42
 
 ## Docker
 
+Build image locally:
+
+```bash
+podman build -t cecep31/wirect:latest .
+```
+
 Pull image:
 
 ```bash
-docker pull cecep31/wirect:latest
+podman pull cecep31/wirect:latest
 ```
 
 Run container:
 
 ```bash
-docker run --rm -p 8080:8080 -e NEW_DOMAIN=https://newdomain.com cecep31/wirect:latest
+podman run --rm -p 8080:8080 -e NEW_DOMAIN=https://newdomain.com cecep31/wirect:latest
 ```
