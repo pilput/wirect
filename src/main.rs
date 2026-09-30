@@ -1,38 +1,48 @@
-use axum::{
-    Router,
-    extract::State,
-    http::Uri,
-    response::{IntoResponse, Redirect, Response},
-    routing::{any, get},
+use http_body_util::Full;
+use hyper::{
+    Method, Request, Response, StatusCode,
+    body::{Bytes, Incoming},
+    header::LOCATION,
+    server::conn::http1,
+    service::service_fn,
 };
-use std::sync::Arc;
+use hyper_util::rt::TokioIo;
+use std::{convert::Infallible, sync::Arc};
+use tokio::net::TcpListener;
 
-#[derive(Clone)]
-struct AppState {
-    base_url: Arc<str>,
-}
+fn redirect_location(base: &str, uri: &hyper::Uri) -> String {
+    let path = uri.path();
 
-impl AppState {
-    fn redirect_location(&self, uri: &Uri) -> String {
-        let base = &*self.base_url;
-        let path = uri.path();
-        let query = uri.query().unwrap_or("");
-
-        if query.is_empty() {
-            format!("{base}{path}")
-        } else {
-            format!("{base}{path}?{query}")
-        }
+    match uri.query() {
+        Some(query) if !query.is_empty() => format!("{base}{path}?{query}"),
+        _ => format!("{base}{path}"),
     }
 }
 
-async fn redirect_handler(State(state): State<AppState>, uri: Uri) -> Response {
-    let location = state.redirect_location(&uri);
-    Redirect::permanent(&location).into_response()
+fn respond(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
+    *response.status_mut() = status;
+    response
 }
 
-async fn health_check() -> &'static str {
-    "OK"
+async fn handle(
+    base_url: Arc<str>,
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.uri().path() == "/health" && matches!(*req.method(), Method::GET | Method::HEAD) {
+        return Ok(respond(StatusCode::OK, "OK"));
+    }
+
+    let location = redirect_location(&base_url, req.uri());
+    let mut response = respond(StatusCode::PERMANENT_REDIRECT, "");
+
+    match location.parse() {
+        Ok(value) => {
+            response.headers_mut().insert(LOCATION, value);
+            Ok(response)
+        }
+        Err(_) => Ok(respond(StatusCode::BAD_REQUEST, "invalid request URI")),
+    }
 }
 
 #[tokio::main]
@@ -41,24 +51,37 @@ async fn main() {
 
     let new_domain = std::env::var("NEW_DOMAIN")
         .expect("NEW_DOMAIN must be set in .env or environment");
-    let base_url: Arc<str> = Arc::from(new_domain.trim_end_matches('/').to_string());
+    let base_url: Arc<str> = Arc::from(new_domain.trim_end_matches('/'));
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let bind_addr = format!("{host}:{port}");
 
-    let state = AppState { base_url };
-
     println!("Starting redirect server on http://{bind_addr}");
-    println!("Redirecting all incoming requests to {}", state.base_url);
+    println!("Redirecting all incoming requests to {base_url}");
 
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .fallback(any(redirect_handler))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
+    let listener = TcpListener::bind(&bind_addr)
         .await
         .expect("failed to bind TCP listener");
-    axum::serve(listener, app).await.unwrap();
+
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                eprintln!("failed to accept connection: {err}");
+                continue;
+            }
+        };
+
+        let base_url = Arc::clone(&base_url);
+        tokio::spawn(async move {
+            let service = service_fn(move |req| handle(Arc::clone(&base_url), req));
+            if let Err(err) = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+            {
+                eprintln!("connection error: {err}");
+            }
+        });
+    }
 }
